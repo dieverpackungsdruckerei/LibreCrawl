@@ -19,9 +19,9 @@ else
     echo "✅ Colima läuft bereits."
 fi
 
-# Build and start the LibreCrawl container using explicit compose path
-echo "🐳 Baue und starte LibreCrawl via Docker Compose..."
-/usr/local/bin/docker-compose up -d --build
+# Start the LibreCrawl container (no rebuild — run docker-compose up -d --build manually after code changes)
+echo "🐳 Starte LibreCrawl via Docker Compose..."
+/usr/local/bin/docker-compose up -d
 
 echo ""
 echo "============================================================"

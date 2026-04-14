@@ -41,7 +41,7 @@ DISABLE_GUEST = args.disable_guest or os.getenv('DISABLE_GUEST', '').lower() in 
 DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'yes')
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
-app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
+app.secret_key = os.getenv('SECRET_KEY', 'librecrawl-secret-key-change-in-production')
 
 # Enable compression for all responses
 Compress(app)

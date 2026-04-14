@@ -1,0 +1,23 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Data & secrets
+data/
+.env
+
+# Git
+.git/
+.gitignore
+
+# Docs & local scripts
+README-Colima.md
+start-colima-librecrawl.sh
+
+# Dev tooling
+dvd-universal-content-v2/

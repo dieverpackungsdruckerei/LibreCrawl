@@ -18,6 +18,8 @@ services:
       - REGISTRATION_DISABLED=${REGISTRATION_DISABLED:-false}
       # Set to "true" for demo mode (1.5GB per-user memory limit)
       - DEMO_MODE=${DEMO_MODE:-false}
+      # Secret key for Flask sessions — set a strong random value in production
+      - SECRET_KEY=${SECRET_KEY:-librecrawl-secret-key-change-in-production}
       # Uncomment these for SMTP sending
       # - SMTP_HOST=${SMTP_HOST}
       # - SMTP_PORT=${SMTP_PORT}
@@ -28,6 +30,12 @@ services:
       # Add this for correct links in the verification emails
       # - MAIN_APP_URL=${MAIN_APP_URL}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/')\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     command: >
       sh -c "
       FLAGS='';
