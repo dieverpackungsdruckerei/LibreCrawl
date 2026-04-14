@@ -53,6 +53,45 @@ chmod +x start-librecrawl.sh
 5. Starts LibreCrawl in local mode (no authentication)
 6. Opens your browser to `http://localhost:5000`
 
+### CLI (Headless / Automated Testing)
+
+LibreCrawl can run without a browser or server — useful for CI/CD pipelines, regression tests, and SEO monitoring.
+
+**Requirements:** Python 3.8+ and installed dependencies (`pip install -r requirements.txt`)
+
+```bash
+# Basic crawl — JSON to stdout
+python cli.py https://example.com
+
+# Shallow crawl, save to file
+python cli.py https://example.com --max-depth 2 --max-urls 100 --output results.json
+
+# CI pipeline — exit 1 if SEO issues are found
+python cli.py https://example.com --fail-on-issues --quiet
+
+# CSV export, no JavaScript rendering
+python cli.py https://example.com --format csv --output crawl.csv --no-js
+
+# All options
+python cli.py --help
+```
+
+**Key flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--max-depth` / `-d` | 3 | Crawl depth |
+| `--max-urls` / `-n` | 500 | Max URLs |
+| `--format` / `-f` | json | `json` or `csv` |
+| `--output` / `-o` | stdout | Output file path |
+| `--no-js` | off | Disable JS rendering (faster) |
+| `--fail-on-issues` | off | Exit 1 if SEO issues found |
+| `--quiet` / `-q` | off | Suppress progress output |
+
+The CLI uses `WebCrawler` directly — no Flask server is started.
+
+---
+
 ### Manual Installation
 
 If you prefer to install manually or want more control:
