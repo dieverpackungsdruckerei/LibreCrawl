@@ -74,7 +74,7 @@ cp .env.example .env
 # Start LibreCrawl
 docker-compose up -d
 
-# Open browser to http://localhost:5000
+# Open browser to http://localhost:5050
 ```
 By default, LibreCrawl runs in local mode for easy personal use. The `.env` file controls this:
 
