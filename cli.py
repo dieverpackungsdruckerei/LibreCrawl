@@ -61,6 +61,8 @@ def build_parser():
                        help='Ignore robots.txt')
     crawl.add_argument('--external',           action='store_true',
                        help='Also crawl external links')
+    crawl.add_argument('--sitemap', action='append', default=[], metavar='URL',
+                       help='Explicit sitemap URL (repeatable; disables automatic sitemap discovery)')
 
     output = p.add_argument_group('Output options')
     output.add_argument('--format',      '-f', choices=['json', 'csv'], default='json',
@@ -102,7 +104,7 @@ def run_crawl(args):
 
     signal.signal(signal.SIGINT, _on_sigint)
 
-    ok, msg = crawler.start_crawl(args.url)
+    ok, msg = crawler.start_crawl(args.url, sitemap_urls=args.sitemap or None)
     if not ok:
         print(f'Error: {msg}', file=sys.stderr)
         sys.exit(1)
@@ -135,6 +137,7 @@ def run_crawl(args):
 def format_output(status, args):
     urls   = status.get('urls', [])
     issues = status.get('issues', [])
+    links  = status.get('links', [])
 
     if args.format == 'csv':
         default_fields = 'url,status_code,title,meta_description,h1,word_count,response_time'
@@ -147,9 +150,11 @@ def format_output(status, args):
     issues_data = json.loads(generate_issues_json_export(issues)) if issues else {}
 
     return json.dumps({
+        'schema_version': 1,
         'crawl_date': time.strftime('%Y-%m-%d %H:%M:%S'),
         'stats':      status.get('stats', {}),
         'urls':       urls_data,
+        'links':      links,
         'issues':     issues_data,
     }, indent=2, ensure_ascii=False)
 

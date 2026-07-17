@@ -206,7 +206,7 @@ class WebCrawler:
             ]
         }
 
-    def start_crawl(self, url, user_id=None, session_id=None):
+    def start_crawl(self, url, user_id=None, session_id=None, sitemap_urls=None):
         """Start crawling from the given URL"""
         if self.is_running:
             return False, "Crawl already in progress"
@@ -253,7 +253,7 @@ class WebCrawler:
             # Discover sitemaps if enabled
             if self.config.get('discover_sitemaps', True):
                 print(f"Starting sitemap discovery for {url}")
-                self._discover_and_add_sitemap_urls(url)
+                self._discover_and_add_sitemap_urls(url, sitemap_urls=sitemap_urls)
                 print(f"Sitemap discovery completed. Total discovered URLs: {self.stats['discovered']}")
 
             # Start auto-save thread if DB enabled
@@ -309,14 +309,15 @@ class WebCrawler:
         self.user_memory.reset()
         self._demo_limit_reached = False
 
-    def _discover_and_add_sitemap_urls(self, base_url):
+    def _discover_and_add_sitemap_urls(self, base_url, sitemap_urls=None):
         """Discover sitemaps and add URLs to crawl queue"""
-        sitemap_urls = self.sitemap_parser.discover_sitemaps(base_url)
+        discovered_urls = (self.sitemap_parser.parse_sitemaps(sitemap_urls)
+                           if sitemap_urls else self.sitemap_parser.discover_sitemaps(base_url))
 
         added_count = 0
         filtered_count = 0
 
-        for url in sitemap_urls:
+        for url in discovered_urls:
             if self._should_crawl_url(url):
                 self.link_manager.add_url(url, 0)
                 added_count += 1
@@ -549,11 +550,18 @@ class WebCrawler:
 
         print(f"get_status called - crawl_results length: {len(self.crawl_results)}, status: {status}, crawled: {self.stats['crawled']}")
 
+        pending = link_stats.get('pending', 0)
+        max_urls = self.config.get('max_urls', 0)
+        truncated = bool(pending and max_urls and self.stats['crawled'] >= max_urls)
         return {
             'status': status,
             'stats': {
                 **self.stats,
-                'discovered': link_stats['discovered']
+                'discovered': link_stats['discovered'],
+                'pending': pending,
+                'truncated': truncated,
+                'max_urls': max_urls,
+                'max_depth_configured': self.config.get('max_depth'),
             },
             'urls': self.crawl_results.copy(),
             'links': self.link_manager.all_links.copy() if self.link_manager else [],

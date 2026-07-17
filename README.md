@@ -82,6 +82,7 @@ python cli.py --help
 |---|---|---|
 | `--max-depth` / `-d` | 3 | Crawl depth |
 | `--max-urls` / `-n` | 500 | Max URLs |
+| `--sitemap URL` | auto | Explicit sitemap; repeat for multiple sitemaps |
 | `--format` / `-f` | json | `json` or `csv` |
 | `--output` / `-o` | stdout | Output file path |
 | `--no-js` | off | Disable JS rendering (faster) |
@@ -89,6 +90,9 @@ python cli.py --help
 | `--quiet` / `-q` | off | Suppress progress output |
 
 The CLI uses `WebCrawler` directly — no Flask server is started.
+JSON output follows the version declared in `EXPORT_SCHEMA_VERSION`. Schema 1
+contains `schema_version`, crawl `stats`, complete `urls`, the collected
+`links`, and grouped `issues`; CSV output remains unchanged.
 
 ---
 

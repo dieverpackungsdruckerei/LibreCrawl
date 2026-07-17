@@ -36,6 +36,10 @@ class SitemapParser:
 
         print(f"Discovering sitemaps for {base_domain}...")
 
+        return self.parse_sitemaps(sitemap_urls)
+
+    def parse_sitemaps(self, sitemap_urls):
+        """Parse an explicit iterable of sitemap URLs."""
         all_urls = []
         for sitemap_url in sitemap_urls:
             try:
