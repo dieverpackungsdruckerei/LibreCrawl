@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.robotparser import RobotFileParser
 import nest_asyncio
 
+from src.core.http_evidence import EvidenceSession, fetch_page, minimal_metadata, validate_target
 from src.core.rate_limiter import RateLimiter
 from src.core.seo_extractor import SEOExtractor
 from src.core.link_manager import LinkManager
@@ -31,7 +32,7 @@ class WebCrawler:
 
     def __init__(self, crawl_id=None, resume_from_db=False):
         # HTTP session
-        self.session = requests.Session()
+        self.session = EvidenceSession()
         self.session.headers.update({
             'User-Agent': 'LibreCrawl/1.0 (Web Crawler)'
         })
@@ -52,6 +53,7 @@ class WebCrawler:
 
         # Demo mode state
         self._demo_limit_reached = False
+        self._terminal_status = None
 
         # Results storage
         self.crawl_results = []
@@ -98,6 +100,7 @@ class WebCrawler:
     def _get_default_config(self):
         """Get default configuration"""
         return {
+            'profile': 'full',
             'max_depth': 3,
             'max_urls': 1000,
             'delay': 1.0,
@@ -219,10 +222,13 @@ class WebCrawler:
             parsed = urlparse(url)
             self.base_url = f"{parsed.scheme}://{parsed.netloc}"
             self.base_domain = parsed.netloc
+            if self.config.get('profile') == 'cockpit':
+                validate_target(url, self.base_url, self.config.get('allow_private_ips', False), self.config['crawl_external'])
+                self.session.policy = dict(base_url=self.base_url, allow_private=self.config.get('allow_private_ips', False), crawl_external=self.config['crawl_external'])
 
             # If URL has a path (not just domain), set max_depth to 0 to only crawl that page
             has_path = parsed.path and parsed.path not in ('/', '')
-            if has_path:
+            if has_path and self.config.get('profile') != 'cockpit':
                 print(f"URL has path '{parsed.path}' - limiting crawl to single page only")
                 self.config['max_depth'] = 0
 
@@ -289,6 +295,7 @@ class WebCrawler:
             self.js_renderer = JavaScriptRenderer(self.config)
 
     def _reset_state(self):
+        self._terminal_status = None
         """Reset crawler state"""
         if self.link_manager:
             self.link_manager.reset()
@@ -329,6 +336,7 @@ class WebCrawler:
 
     def stop_crawl(self):
         """Stop the current crawl"""
+        self._terminal_status = "stopped"
         self.is_running = False
         self.is_paused = False
         self.is_running_pagespeed = False
@@ -519,16 +527,9 @@ class WebCrawler:
             traceback.print_exc()
             return False, f"Error resuming crawl: {str(e)}"
 
-    def get_status(self):
+    def get_status(self, include_results=True):
         """Get current crawl status and results"""
-        if self._demo_limit_reached and not self.is_running:
-            status = 'demo_stopped'
-        elif not self.is_running and self.stats['crawled'] > 0:
-            status = 'completed'
-        elif not self.is_running and self.stats['crawled'] == 0:
-            status = 'idle'
-        else:
-            status = 'running'
+        status = self._terminal_status or ('running' if self.is_running else 'idle')
 
         # Calculate speed
         if self.stats['start_time']:
@@ -539,7 +540,7 @@ class WebCrawler:
         link_stats = self.link_manager.get_stats() if self.link_manager else {'discovered': 0}
 
         # Update link statuses before returning (ensures all crawled URLs have their status)
-        if self.link_manager:
+        if self.link_manager and include_results:
             self.link_manager.update_link_statuses(self.crawl_results)
 
         # Update memory stats
@@ -548,24 +549,28 @@ class WebCrawler:
         # Per-user data sizes from incremental tracker (O(1), no recursion)
         data_sizes = self.user_memory.get_stats()
 
-        print(f"get_status called - crawl_results length: {len(self.crawl_results)}, status: {status}, crawled: {self.stats['crawled']}")
-
         pending = link_stats.get('pending', 0)
         max_urls = self.config.get('max_urls', 0)
         truncated = bool(pending and max_urls and self.stats['crawled'] >= max_urls)
+        coverage_complete = bool(status == 'completed' and not truncated and not self._demo_limit_reached
+                                 and pending == 0 and self.stats['crawled'] > 0
+                                 and self.stats['crawled'] == link_stats['discovered'])
         return {
             'status': status,
+            'profile': self.config.get('profile', 'full'),
+            'target_evidence': dict(self.link_manager.target_evidence) if self.link_manager and include_results else {},
             'stats': {
                 **self.stats,
                 'discovered': link_stats['discovered'],
                 'pending': pending,
                 'truncated': truncated,
+                'coverage_complete': coverage_complete,
                 'max_urls': max_urls,
                 'max_depth_configured': self.config.get('max_depth'),
             },
-            'urls': self.crawl_results.copy(),
-            'links': self.link_manager.all_links.copy() if self.link_manager else [],
-            'issues': self.issue_detector.get_issues() if self.issue_detector else [],
+            'urls': self.crawl_results.copy() if include_results else [],
+            'links': self.link_manager.all_links.copy() if self.link_manager and include_results else [],
+            'issues': self.issue_detector.get_issues() if self.issue_detector and include_results else [],
             'progress': min(100, (self.stats['crawled'] / max(link_stats['discovered'], 1)) * 100),
             'is_running_pagespeed': self.is_running_pagespeed,
             'memory': self.memory_monitor.get_stats(),
@@ -662,6 +667,8 @@ class WebCrawler:
     def update_config(self, new_config):
         """Update crawler configuration"""
         self.config.update(new_config)
+        if self.config.get('profile') == 'cockpit':
+            self.config.update(enable_javascript=False, enable_duplication_check=False)
 
         # Update session headers
         self.session.headers.update({
@@ -690,6 +697,21 @@ class WebCrawler:
                 self.rate_limiter.update_rate(100.0)
 
     def _crawl_worker(self):
+        """Record the actual termination, independently of result counts."""
+        try:
+            self._crawl_worker_impl()
+            if self._terminal_status is None:
+                self._terminal_status = 'demo_stopped' if self._demo_limit_reached else 'completed'
+        except Exception as exc:
+            self._terminal_status = 'failed'
+            print(f"Crawl failed: {exc}")
+        finally:
+            self.is_running = False
+            if self.db_save_enabled and self.crawl_id:
+                from src.crawl_db import set_crawl_status
+                set_crawl_status(self.crawl_id, self._terminal_status)
+
+    def _crawl_worker_impl(self):
         """Main crawling worker with smooth rate limiting"""
         # Use async approach if JavaScript rendering is enabled
         if self.config.get('enable_javascript', False):
@@ -712,7 +734,7 @@ class WebCrawler:
 
                     # Submit new tasks - fill ALL available slots, apply rate limiting per task
                     while (len(active_futures) < max_workers and
-                           self.stats['crawled'] < self.config['max_urls']):
+                           self.stats['crawled'] + len(active_futures) < self.config['max_urls']):
 
                         url_info = self.link_manager.get_next_url()
                         if not url_info:
@@ -748,7 +770,8 @@ class WebCrawler:
 
                                     # Detect issues
                                     issues_before = len(self.issue_detector.detected_issues)
-                                    self.issue_detector.detect_issues(result)
+                                    if self.config.get('profile') != 'cockpit' and result.get('html_usable', True):
+                                        self.issue_detector.detect_issues(result)
                                     issues_after = len(self.issue_detector.detected_issues)
 
                                     # Track + batch new issues
@@ -758,6 +781,7 @@ class WebCrawler:
                                         if self.db_save_enabled:
                                             self.unsaved_issues.extend(new_issues)
                             except Exception as e:
+                                self._terminal_status = "failed"
                                 print(f"Error in crawl task: {e}")
 
                     # Remove completed futures
@@ -785,8 +809,9 @@ class WebCrawler:
                     time.sleep(0.001)
 
                 except Exception as e:
+                    self._terminal_status = "failed"
                     print(f"Error in crawl worker: {e}")
-                    time.sleep(1)
+                    break
 
         # Skip post-processing if demo limit was hit — no further memory use
         if not self._demo_limit_reached:
@@ -832,145 +857,48 @@ class WebCrawler:
             return self._crawl_url_with_requests(url, depth)
 
     def _crawl_url_with_requests(self, url, depth):
-        """Crawl a single URL using traditional HTTP requests"""
-        print(f"Starting crawl of {url}")
-        retries = self.config.get('retries', 3)
-        start_time = time.time()
-
-        try:
-            # Check file size if configured
-            if self.config.get('max_file_size', 0) > 0:
-                try:
-                    head_response = self.session.head(
-                        url,
-                        timeout=self.config['timeout'],
-                        allow_redirects=self.config['follow_redirects']
-                    )
-                    content_length = head_response.headers.get('content-length')
-                    if content_length and int(content_length) > self.config['max_file_size']:
-                        return self.seo_extractor.create_empty_result(
-                            url, depth, 0,
-                            f'File too large: {content_length} bytes'
-                        )
-                except:
-                    pass  # Continue if HEAD request fails
-
-            # Fetch the page with retries
-            response = None
-            for attempt in range(retries + 1):
-                try:
-                    response = self.session.get(
-                        url,
-                        timeout=self.config['timeout'],
-                        allow_redirects=self.config['follow_redirects']
-                    )
-                    break
-                except Exception as e:
-                    if attempt >= retries:
-                        raise e
-                    time.sleep(1)
-
-            # Determine if URL is internal
-            is_internal = self.link_manager.is_internal(url)
-
-            # Create result structure
-            result = {
-                'url': url,
-                'status_code': response.status_code,
-                'content_type': response.headers.get('content-type', '').split(';')[0],
-                'size': len(response.content),
-                'is_internal': is_internal,
-                'depth': depth,
-                'title': '',
-                'meta_description': '',
-                'h1': '',
-                'h2': [],
-                'h3': [],
-                'word_count': 0,
-                'meta_tags': {},
-                'og_tags': {},
-                'twitter_tags': {},
-                'canonical_url': '',
-                'lang': '',
-                'charset': '',
-                'viewport': '',
-                'robots': '',
-                'author': '',
-                'keywords': '',
-                'generator': '',
-                'theme_color': '',
-                'json_ld': [],
-                'analytics': {
-                    'google_analytics': False,
-                    'gtag': False,
-                    'ga4_id': '',
-                    'gtm_id': '',
-                    'facebook_pixel': False,
-                    'hotjar': False,
-                    'mixpanel': False
-                },
-                'images': [],
-                'external_links': 0,
-                'internal_links': 0,
-                'response_time': 0,
-                'redirects': [],
-                'hreflang': [],
-                'schema_org': [],
-                'linked_from': []
-            }
-
-            # Only parse HTML content
-            if 'text/html' in response.headers.get('content-type', ''):
-                soup = BeautifulSoup(response.content, 'html.parser')
-
-                # Extract comprehensive data using SEO extractor
+        """One bounded GET per response, with explicit redirect evidence."""
+        result, content = fetch_page(self, url, depth)
+        if result['html_usable']:
+            parsed_at = time.monotonic()
+            soup = BeautifulSoup(content, 'html5lib')
+            if self.config.get('profile') == 'cockpit':
+                minimal_metadata(soup, result)
+            else:
                 self.seo_extractor.extract_basic_seo_data(soup, result)
                 self.seo_extractor.extract_meta_tags(soup, result)
                 self.seo_extractor.extract_opengraph_tags(soup, result)
                 self.seo_extractor.extract_twitter_tags(soup, result)
                 self.seo_extractor.extract_json_ld(soup, result)
-                self.seo_extractor.extract_analytics_tracking(soup, response.text, result)
-                self.seo_extractor.extract_images(soup, url, result)
+                self.seo_extractor.extract_analytics_tracking(soup, str(soup), result)
+                self.seo_extractor.extract_images(soup, result['final_url'], result)
                 self.seo_extractor.extract_link_counts(soup, result, self.base_domain)
                 self.seo_extractor.extract_hreflang(soup, result)
                 self.seo_extractor.extract_schema_org(soup, result)
-
-                # Collect all links
-                links_before = len(self.link_manager.all_links)
-                self.link_manager.collect_all_links(soup, url, self.crawl_results)
-                links_after = len(self.link_manager.all_links)
-
-                # Track + batch new links
-                if links_after > links_before:
-                    new_links = self.link_manager.all_links[links_before:links_after]
-                    self.user_memory.track_links(new_links)
-                    if self.db_save_enabled:
-                        self.unsaved_links.extend(new_links)
-
-                # Extract links for further crawling
-                should_extract = (
-                    (is_internal and depth < self.config['max_depth']) or
-                    (self.config['crawl_external'] and depth < self.config['max_depth'])
-                )
-
-                if should_extract:
-                    self.link_manager.extract_links(soup, url, depth + 1, self._should_crawl_url)
-
-            # Populate linked_from after all link collection is complete
-            result['linked_from'] = self.link_manager.get_source_pages(url)
-            result['response_time'] = round((time.time() - start_time) * 1000, 2)
-
-            # Add to unsaved batch if DB persistence enabled
+                if result.get('canonical_url'):
+                    result['canonical_url'] = urljoin(result['final_url'], result['canonical_url'])
+            link_base = result['final_url']
+            base_tag = soup.find('base', href=True)
+            if base_tag:
+                candidate = urljoin(link_base, base_tag['href'])
+                if urlparse(candidate).scheme in ('http', 'https') and urlparse(candidate).hostname == urlparse(link_base).hostname:
+                    link_base = candidate
+            links_before = len(self.link_manager.all_links)
+            self.link_manager.collect_all_links(soup, url, self.crawl_results, base_url=link_base)
+            new_links = self.link_manager.all_links[links_before:]
+            self.user_memory.track_links(new_links)
             if self.db_save_enabled:
-                self.unsaved_urls.append(result)
-                # Trigger batch save if threshold reached
-                if len(self.unsaved_urls) >= self.batch_save_size:
-                    self._save_batch_to_db()
-
-            return result
-
-        except Exception as e:
-            return self.seo_extractor.create_empty_result(url, depth, 0, str(e))
+                self.unsaved_links.extend(new_links)
+            if depth < self.config['max_depth'] and (result['is_internal'] or self.config['crawl_external']):
+                self.link_manager.extract_links(soup, link_base, depth + 1, self._should_crawl_url, source_url=url)
+            result['parse_time_ms'] = round((time.monotonic() - parsed_at) * 1000, 2)
+        result['linked_from'] = self.link_manager.get_source_pages(url)
+        self.link_manager.record_result(result)
+        if self.db_save_enabled:
+            self.unsaved_urls.append(result)
+            if len(self.unsaved_urls) >= self.batch_save_size:
+                self._save_batch_to_db()
+        return result
 
     async def _crawl_url_with_javascript(self, url, depth):
         """Crawl a single URL using JavaScript rendering"""
@@ -1146,6 +1074,7 @@ class WebCrawler:
                                     if self.db_save_enabled:
                                         self.unsaved_issues.extend(new_issues)
                         except Exception as e:
+                            self._terminal_status = "failed"
                             print(f"Error in async crawl task: {e}")
 
                 # Demo mode: check per-user memory limit
@@ -1213,6 +1142,9 @@ class WebCrawler:
     def _should_crawl_url(self, url):
         """Check if URL should be crawled based on settings"""
         parsed = urlparse(url)
+
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
+            return False
 
         # Check external domain policy
         if not self.config['crawl_external']:

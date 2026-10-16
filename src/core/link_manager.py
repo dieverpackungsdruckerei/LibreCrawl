@@ -1,5 +1,6 @@
 """Link management and extraction"""
 import threading
+import re
 from urllib.parse import urljoin, urlparse
 from collections import deque
 
@@ -14,12 +15,15 @@ class LinkManager:
         self.all_discovered_urls = set()
         self.all_links = []
         self.links_set = set()
+        self.link_index = {}
+        self.target_evidence = {}
+        self.status_index = {}
         self.source_pages = {}  # Maps target_url -> list of source_urls
 
         self.urls_lock = threading.Lock()
         self.links_lock = threading.Lock()
 
-    def extract_links(self, soup, current_url, depth, should_crawl_callback):
+    def extract_links(self, soup, current_url, depth, should_crawl_callback, source_url=None):
         """Extract links from HTML and add to discovery queue"""
         links = soup.find_all('a', href=True)
 
@@ -42,8 +46,9 @@ class LinkManager:
                 # Track source page for this URL
                 if clean_url not in self.source_pages:
                     self.source_pages[clean_url] = []
-                if current_url not in self.source_pages[clean_url]:
-                    self.source_pages[clean_url].append(current_url)
+                source = source_url or current_url
+                if source not in self.source_pages[clean_url]:
+                    self.source_pages[clean_url].append(source)
 
                 if (clean_url not in self.visited_urls and
                     clean_url not in self.all_discovered_urls and
@@ -54,7 +59,7 @@ class LinkManager:
                         self.all_discovered_urls.add(clean_url)
                         self.discovered_urls.append((clean_url, depth))
 
-    def collect_all_links(self, soup, source_url, crawl_results):
+    def collect_all_links(self, soup, source_url, crawl_results, base_url=None):
         """Collect all links for the Links tab display"""
         links = soup.find_all('a', href=True)
 
@@ -72,8 +77,10 @@ class LinkManager:
 
             # Convert relative URLs to absolute
             try:
-                absolute_url = urljoin(source_url, href)
+                absolute_url = urljoin(base_url or source_url, href)
                 parsed_target = urlparse(absolute_url)
+                if parsed_target.scheme not in ('http', 'https') or not parsed_target.hostname:
+                    continue
 
                 # Clean URL (remove fragment)
                 clean_url = f"{parsed_target.scheme}://{parsed_target.netloc}{parsed_target.path}"
@@ -85,12 +92,7 @@ class LinkManager:
                 base_domain_clean = self.base_domain.replace('www.', '', 1)
                 is_internal = target_domain_clean == base_domain_clean
 
-                # Find the status of the target URL if we've crawled it
-                target_status = None
-                for result in crawl_results:
-                    if result['url'] == clean_url:
-                        target_status = result['status_code']
-                        break
+                target_status = self.status_index.get(clean_url)
 
                 # Determine placement (navigation, footer, body)
                 placement = self._detect_link_placement(link)
@@ -102,7 +104,8 @@ class LinkManager:
                     'is_internal': is_internal,
                     'target_domain': parsed_target.netloc,
                     'target_status': target_status,
-                    'placement': placement
+                    'placement': placement,
+                    'occurrences': [{'anchor_text': anchor_text or '(no text)', 'placement': placement}]
                 }
 
                 # Track source page for this URL (for "Linked From" feature)
@@ -114,11 +117,16 @@ class LinkManager:
 
                 # Thread-safe adding to links collection with duplicate checking
                 with self.links_lock:
-                    link_key = f"{link_data['source_url']}|{link_data['target_url']}"
+                    link_key = (link_data['source_url'], link_data['target_url'])
 
                     if link_key not in self.links_set:
                         self.links_set.add(link_key)
                         self.all_links.append(link_data)
+                        self.link_index[link_key] = link_data
+                    else:
+                        existing = self.link_index.get(link_key)
+                        if existing is not None:
+                            existing['occurrences'].extend(link_data['occurrences'])
 
             except Exception:
                 continue
@@ -146,8 +154,8 @@ class LinkManager:
                 return 'navigation'
 
             # Check for navigation by class/id
-            if any(keyword in classes_str or keyword in element_id.lower()
-                   for keyword in ['nav', 'menu', 'header']):
+            if any(re.search(r'(^|[\s_-])(nav|menu|header)([\s_-]|$)', value)
+                   for value in (classes_str, element_id.lower())):
                 return 'navigation'
 
             current = current.parent
@@ -190,16 +198,22 @@ class LinkManager:
                 'pending': len(self.discovered_urls)
             }
 
-    def update_link_statuses(self, crawl_results):
-        """Update target_status for all links based on crawl results"""
-        # Build a fast lookup dict
-        status_lookup = {result['url']: result['status_code'] for result in crawl_results}
-
+    def record_result(self, result):
+        """Keep one O(1) response lookup per original URL."""
         with self.links_lock:
+            self.status_index[result['url']] = result['status_code']
+            self.target_evidence[result['url']] = {
+                key: result.get(key) for key in ('url', 'final_url', 'status_code', 'content_type',
+                    'html_usable', 'robots', 'x_robots_tag', 'canonical_url', 'redirects',
+                    'error', 'error_kind', 'request_time_ms', 'parse_time_ms', 'retry_count', 'backoff_ms')
+            }
+
+    def update_link_statuses(self, crawl_results):
+        """Linear graph pass; no per-link scan of the result list."""
+        with self.links_lock:
+            self.status_index.update({result['url']: result['status_code'] for result in crawl_results})
             for link in self.all_links:
-                target_url = link['target_url']
-                if target_url in status_lookup:
-                    link['target_status'] = status_lookup[target_url]
+                link['target_status'] = self.status_index.get(link['target_url'])
 
     def get_source_pages(self, url):
         """Get list of source pages that link to this URL"""
@@ -217,3 +231,6 @@ class LinkManager:
         with self.links_lock:
             self.all_links.clear()
             self.links_set.clear()
+            self.link_index.clear()
+            self.status_index.clear()
+            self.target_evidence.clear()
