@@ -37,6 +37,9 @@ from src.export import (
 )
 
 
+EXPORT_SCHEMA_VERSION = 2
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog='librecrawl',
@@ -47,6 +50,10 @@ def build_parser():
     p.add_argument('url', help='Start URL to crawl')
 
     crawl = p.add_argument_group('Crawl options')
+    crawl.add_argument('--allow-private-ips', action='store_true',
+                       help='Allow private targets explicitly (local environments only)')
+    crawl.add_argument('--profile', choices=['full', 'cockpit'], default='full',
+                       help='Cockpit collects response evidence and link graph without duplicate SEO checks')
     crawl.add_argument('--max-depth',    '-d', type=int,   default=3,
                        help='Maximum crawl depth (default: 3)')
     crawl.add_argument('--max-urls',     '-n', type=int,   default=500,
@@ -73,7 +80,9 @@ def build_parser():
                         help='Comma-separated list of fields for CSV export '
                              '(default: url,status_code,title,meta_description,h1,word_count,response_time)')
     output.add_argument('--quiet',       '-q', action='store_true',
-                        help='Suppress progress output on stderr')
+                       help='Suppress progress output on stderr')
+    output.add_argument('--progress-jsonl', action='store_true',
+                       help='Emit machine-readable @@progress events on stderr')
     output.add_argument('--fail-on-issues',    action='store_true',
                         help='Exit with code 1 if any SEO issues are detected (useful for CI)')
 
@@ -85,6 +94,8 @@ def run_crawl(args):
     crawler.db_save_enabled = False  # no DB overhead in CLI mode
 
     config = {
+        'profile':            args.profile,
+        'allow_private_ips':  args.allow_private_ips,
         'max_depth':          args.max_depth,
         'max_urls':           args.max_urls,
         'delay':              args.delay,
@@ -109,15 +120,21 @@ def run_crawl(args):
         print(f'Error: {msg}', file=sys.stderr)
         sys.exit(1)
 
-    # Polling loop with progress output to stderr
+    # Polling loop: human progress or stable events for automation.
     terminal_statuses = ('completed', 'failed', 'stopped', 'demo_stopped')
     while True:
-        s = crawler.get_status()
+        s = crawler.get_status(include_results=False)
+        pct = s.get('progress', 0)
+        crawled = s['stats'].get('crawled', 0)
+        found = s['stats'].get('discovered', 0)
+        speed = s['stats'].get('speed', 0)
+        if args.progress_jsonl:
+            print('@@progress ' + json.dumps({
+                'phase': 'crawl', 'current': crawled, 'total': found or None,
+                'speed': speed, 'detail': f'{crawled} von {found} entdeckten URLs',
+                'status': s['status'], 'percent': pct,
+            }, ensure_ascii=False), file=sys.stderr, flush=True)
         if not args.quiet:
-            pct     = s.get('progress', 0)
-            crawled = s['stats'].get('crawled', 0)
-            found   = s['stats'].get('discovered', 0)
-            speed   = s['stats'].get('speed', 0)
             print(
                 f'\r  {pct:5.1f}%  {crawled}/{found} URLs  {speed:.1f} URLs/s   ',
                 end='',
@@ -126,7 +143,7 @@ def run_crawl(args):
             )
         if s['status'] in terminal_statuses:
             break
-        time.sleep(0.5)
+        time.sleep(1)
 
     if not args.quiet:
         print(file=sys.stderr)  # newline after progress line
@@ -145,12 +162,14 @@ def format_output(status, args):
         return generate_csv_export(urls, fields)
 
     # JSON: combine stats + urls + issues into one document
-    fields = list(urls[0].keys()) if urls else []
-    urls_data   = json.loads(generate_json_export(urls, fields))['data'] if urls else []
+    urls_data = urls
     issues_data = json.loads(generate_issues_json_export(issues)) if issues else {}
 
     return json.dumps({
-        'schema_version': 1,
+        'schema_version': EXPORT_SCHEMA_VERSION if getattr(args, 'profile', 'full') == 'cockpit' else 1,
+        'profile': getattr(args, 'profile', 'full'),
+        'status': status.get('status', 'unknown'),
+        'target_evidence': status.get('target_evidence', {}),
         'crawl_date': time.strftime('%Y-%m-%d %H:%M:%S'),
         'stats':      status.get('stats', {}),
         'urls':       urls_data,
@@ -166,6 +185,24 @@ def main():
         print(f'Crawling: {args.url}', file=sys.stderr)
 
     status = run_crawl(args)
+    if args.format == 'json':
+        document = {
+            'schema_version': EXPORT_SCHEMA_VERSION if args.profile == 'cockpit' else 1,
+            'profile': args.profile, 'status': status.get('status', 'unknown'), 'crawl_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'stats': status.get('stats', {}), 'urls': status.get('urls', []),
+            'links': status.get('links', []), 'target_evidence': status.get('target_evidence', {}),
+            'issues': json.loads(generate_issues_json_export(status.get('issues', []))) if status.get('issues') else {},
+        }
+        destination = open(args.output, 'w', encoding='utf-8') if args.output else sys.stdout
+        try:
+            json.dump(document, destination, indent=2, ensure_ascii=False, default=str)
+            destination.write('\n')
+        finally:
+            if args.output:
+                destination.close()
+        if status.get('status') == 'failed' or (args.fail_on_issues and status.get('issues')):
+            sys.exit(1)
+        return
     output = format_output(status, args)
 
     if args.output:
@@ -182,7 +219,7 @@ def main():
     else:
         print(output)
 
-    if args.fail_on_issues and status.get('issues'):
+    if status.get('status') == 'failed' or (args.fail_on_issues and status.get('issues')):
         sys.exit(1)
 
 
